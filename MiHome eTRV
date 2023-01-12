@@ -1,0 +1,292 @@
+/**
+ *  MiHome eTRV
+ *
+ *  Copyright 2023 Sundar Mathiyalagan
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ *  in compliance with the License. You may obtain a copy of the License at:
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
+ *  on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
+ *  for the specific language governing permissions and limitations under the License.
+ *
+ *
+ *	VERSION HISTORY
+ *
+ *  12.01.2023: 1.0 - Initial Release
+ *
+ */
+ 
+import groovy.json.JsonOutput
+metadata {
+	definition (name: "MiHome eTRV", namespace: "suneshwar007", author: "Sundar Mathiyalagan", ocfDeviceType: "oic.d.thermostat", vid: "generic-thermostat-1") {
+	
+        //Hubitat Capability
+        capability "Actuator"
+		capability "Polling"
+		capability "Refresh"
+		capability "TemperatureMeasurement"
+        capability "Thermostat"
+		capability "ThermostatHeatingSetpoint"
+        capability "HealthCheck"
+        
+        //Input Attribute
+        attribute "supportedThermostatModes", "JSON_OBJECT"
+        
+        //Hubitat Command
+        command "heatingSetpointUp"
+		command "heatingSetpointDown"
+        command "setBoostLength"
+        command "setSupportedThermostatModes", ["JSON_OBJECT"]
+	}
+
+	preferences {
+        input( name: "logEnable", type:"bool", title: "Enable debug logging",defaultValue: false)
+		input( name: "txtEnable", type:"bool", title: "Enable descriptionText logging", defaultValue: true)
+	}
+}
+
+def installed() {
+	log.debug "Executing 'installed'"
+    state.boostLength = 60
+    sendEvent(name: "checkInterval", value: 10 * 60 + 2 * 60, data: [protocol: "cloud"], displayed: false)
+    initialize()
+}
+
+void updated() {
+	log.debug "Executing 'updated'"
+    sendEvent(name: "checkInterval", value: 10 * 60 + 2 * 60, data: [protocol: "cloud"], displayed: false)
+    initialize()
+}
+
+def initialize() {
+
+		setSupportedThermostatModes(JsonOutput.toJson(["auto","emergency heat", "heat", "off"]))
+    
+}
+
+def uninstalled() {
+    unschedule()
+}
+
+// parse events into attributes
+def parse(String description) {
+	log.debug "Parsing '${description}'"
+	// TODO: handle 'temperature' attribute
+	// TODO: handle 'heatingSetpoint' attribute
+	// TODO: handle 'thermostatSetpoint' attribute
+	// TODO: handle 'thermostatMode' attribute
+	// TODO: handle 'thermostatOperatingState' attribute
+}
+
+// handle commands
+def setHeatingSetpoint(temp) {
+	log.debug "Executing 'setHeatingSetpoint with temp $temp'"
+	def latestThermostatMode = device.latestState('thermostatMode')
+    
+    if (temp < 12) {
+		temp = 12
+	}
+	if (temp > 30) {
+		temp = 30
+	}
+    sendEvent(name: "boostSwitch", value: "off", displayed: false)
+    def resp = parent.apiGET("/subdevices/set_target_temperature?params=" + URLEncoder.encode(new groovy.json.JsonBuilder([id: device.deviceNetworkId.toInteger(), temperature: temp]).toString()))
+	if (resp.status != 200) {
+		log.error("Unexpected result in poll(): [${resp.status}] ${resp.data}")
+	}
+    else {
+    	runIn(1, refresh)
+    } 
+}
+
+def setBoostLength(minutes) {
+	log.debug "Executing 'setBoostLength with length $minutes minutes'"
+    if (minutes < 60) {
+		minutes = 60
+	}
+	if (minutes > 300) {
+		minutes = 300
+	}
+    state.boostLength = minutes
+    sendEvent(name:"boostLength", value: state.boostLength, displayed: true)
+    
+    def latestThermostatMode = device.latestState('thermostatMode')
+    
+//If already in BOOST mode, send updated boost length.
+	if (latestThermostatMode.stringValue == 'emergency heat') {
+		setThermostatMode('emergency heat')
+    }
+    else {
+    	refresh()
+    }    
+}
+
+def stopBoost() {
+	log.debug "Executing 'stopBoost'"
+	sendEvent(name: "boostSwitch", value: "off", displayed: false)
+    if (state.lastThermostatMode == 'off') {
+    	off()
+    }
+    else {
+    	heat()
+    }
+}
+
+def heatingSetpointUp(){
+	log.debug "Executing 'heatingSetpointUp'"
+	int newSetpoint = device.currentValue("heatingSetpoint") + 1
+	log.debug "Setting heat set point up to: ${newSetpoint}"
+	setHeatingSetpoint(newSetpoint)
+}
+
+def heatingSetpointDown(){
+	log.debug "Executing 'heatingSetpointDown'"
+	int newSetpoint = device.currentValue("heatingSetpoint") - 1
+	log.debug "Setting heat set point down to: ${newSetpoint}"
+	setHeatingSetpoint(newSetpoint)
+}
+
+def setCoolingSetpoint(temp){
+	log.trace "Set cooling setpoint temp of ${temp}, sending temp value to setHeatingSetpoint"
+	return setHeatingSetpoint(temp)
+    }
+
+def setLastHeatingSetpoint(temp) {
+//Don't store set point if it is 12.
+	if (temp > 12) {
+		state.lastHeatingSetPoint = temp
+    }
+}
+
+def off() {
+	setThermostatMode('off')
+    
+}
+	
+def heat() {
+	setThermostatMode('heat')
+}
+
+def emergencyHeat() {
+	log.debug "Executing 'boost'"
+	
+    def latestThermostatMode = device.latestState('thermostatMode')
+    
+//Don't do if already in BOOST mode.
+	if (latestThermostatMode.stringValue != 'emergency heat') {
+		setThermostatMode('emergency heat')
+    }
+    else {
+    	log.debug "Already in boost mode."
+    }
+}
+
+def auto() {
+	setThermostatMode('heat')
+}
+
+def setSupportedThermostatModes(modes) {
+    logDebug "setSupportedThermostatModes(${modes},${descriptionText}) was called"
+	// (auto, emergency heat, heat, off)
+	sendEvent(name: "supportedThermostatModes", value: modes, descriptionText: getDescriptionText("supportedThermostatModes set to ${modes}"))
+}
+
+def setThermostatMode(mode) {
+	mode = mode == 'cool' ? 'heat' : mode
+	log.debug "Executing 'setThermostatMode with mode $mode'"
+    
+    if (mode == 'off') {
+    	unschedule(stopBoost)
+        sendEvent(name: "boostSwitch", value: "off", displayed: false)
+    	setLastHeatingSetpoint(device.currentValue('heatingSetpoint'))
+    	setHeatingSetpoint(12)
+    } else if (mode == 'emergency heat') { 
+    	if (state.boostLength == null || state.boostLength == '')
+        {
+        	state.boostLength = 60
+            sendEvent("name":"boostLength", "value": 60, displayed: true)
+        }
+        state.lastThermostatMode = device.latestState('thermostatMode')
+        setLastHeatingSetpoint(device.currentValue('heatingSetpoint'))
+        sendEvent(name: "boostSwitch", value: "on", displayed: false)
+        def resp = parent.apiGET("/subdevices/set_target_temperature?params=" + URLEncoder.encode(new groovy.json.JsonBuilder([id: device.deviceNetworkId.toInteger(), temperature: 22]).toString()))
+
+        if (resp.status != 200) {
+			log.error("Unexpected result in poll(): [${resp.status}] ${resp.data}")
+		}
+   	 	else {
+    		refresh()
+    	}  
+
+    } 
+    else {
+    	unschedule(stopBoost)
+        sendEvent(name: "boostSwitch", value: "off", displayed: false)
+    	def lastHeatingSetPoint = 21
+        if (state.lastHeatingSetPoint != null && state.lastHeatingSetPoint > 12)
+        {
+        	lastHeatingSetPoint = state.lastHeatingSetPoint
+        }
+    	setHeatingSetpoint(lastHeatingSetPoint)
+    } 
+}
+
+def poll() {
+    
+    log.debug "Executing 'poll' for ${device} ${this} ${device.deviceNetworkId}"
+    
+    def resp = parent.apiGET("/subdevices/show?params=" + URLEncoder.encode(new groovy.json.JsonBuilder([id: device.deviceNetworkId.toInteger()]).toString()))
+	if (resp.status != 200) {
+		log.error("Unexpected result in poll(): [${resp.status}] ${resp.data}")
+		return []
+	}
+    
+//Boost button label
+    if (state.boostLength == null || state.boostLength == '')
+    {
+        state.boostLength = 60
+        sendEvent("name":"boostLength", "value": 60, displayed: true)
+    }
+    
+	def boostLabel = ""    
+    def boostSwitch = device.currentValue("boostSwitch")
+    if (boostSwitch != null && boostSwitch == "on") {
+    	sendEvent(name: "thermostatMode", value: "emergency heat")
+        boostLabel = "Boosting"
+    }
+    else {
+		sendEvent(name: "thermostatMode", value: resp.data.data.target_temperature == 12 ? "off" : "heat")
+        boostLabel = "Start\n$state.boostLength Min Boost"
+    }
+//SendEvent to Current State
+    sendEvent(name: "temperature", value: resp.data.data.last_temperature, unit: "C", state: "heat")
+    sendEvent(name: "heatingSetpoint", value: resp.data.data.target_temperature, unit: "C", state: "heat")
+    sendEvent(name: "coolingSetpoint", value: resp.data.data.target_temperature, unit: "C", state: "heat")
+    sendEvent(name: 'thermostatOperatingState', value: resp.data.data.target_temperature == 12 ? "idle" : "heating")
+    sendEvent(name: "batteryVoltage", value: resp.data.data.voltage == null ? "Not Available" : resp.data.data.voltage + "V")
+    sendEvent(name: "boostLabel", value: boostLabel, displayed: false)
+// Call Initialize to setSupportedThermostatModes   
+    initialize()
+    
+    return []
+	
+}
+
+def refresh() {
+	log.debug "Executing 'refresh'"
+	poll()
+}
+
+//Private Method
+private logDebug(msg) {
+	if (settings?.logEnable) log.debug "LogDebug Message is: ${msg}"
+}
+
+private getDescriptionText(msg) {
+	def descriptionText = "Description Text is ${device.displayName} ${msg}"
+	if (settings?.txtEnable) log.info "${descriptionText}"
+	return descriptionText
+}
